@@ -1,0 +1,7 @@
+# WebAssembly Build Artifacts
+blackjack.js
+blackjack.wasm
+
+# OS generated files (Optional)
+.DS_Store
+Thumbs.db

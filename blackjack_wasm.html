@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BLACKJACK: JUDGMENT DAY — FRA143</title>
+
+  <!--
+  ══════════════════════════════════════════════════════════════════════
+  BUILD WASM FIRST:
+    emcc game_logic.cpp -o blackjack.js \
+      -s EXPORTED_FUNCTIONS="['_bj_new_game','_bj_get_state', \
+        '_bj_place_bet','_bj_cancel_bet','_bj_deal', \
+        '_bj_player_hit','_bj_player_stand','_bj_use_skill', \
+        '_bj_run_judge_turn']" \
+      -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap']" \
+      -std=c++17 -O3
+  ══════════════════════════════════════════════════════════════════════
+  -->
+
+  <!-- Emscripten output — game_logic.cpp compiled to WASM -->
+  <script src="blackjack.js"></script>
+
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <style>* { box-sizing: border-box; margin: 0; padding: 0; } html, body, #root { background: #08080c; min-height: 100vh; }</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ══════════════════════════════════════════════════════════════════════
+// WASM BRIDGE
+// Thin wrapper around the C-API exported by game_logic.cpp.
+// ALL game logic lives in C++. This file contains UI only.
+// ══════════════════════════════════════════════════════════════════════
+const GE = {
+  newGame:      ()    => Module.ccall("bj_new_game",      null,     [],         []),
+  getState:     ()    => JSON.parse(Module.ccall("bj_get_state",   "string",   [], [])),
+  placeBet:     (a)   => Module.ccall("bj_place_bet",     "number", ["number"], [a]),
+  cancelBet:    ()    => Module.ccall("bj_cancel_bet",    null,     [],         []),
+  deal:         ()    => Module.ccall("bj_deal",          null,     [],         []),
+  playerHit:    ()    => Module.ccall("bj_player_hit",    "number", [],         []),
+  playerStand:  ()    => Module.ccall("bj_player_stand",  null,     [],         []),
+  useSkill:     (i)   => Module.ccall("bj_use_skill",     "string", ["number"], [i]),
+  nextRound: () => Module.ccall("bj_next_round", null, [], []),
+  runJudgeTurn: ()    => JSON.parse(Module.ccall("bj_run_judge_turn","string",  [], [])),
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// CONSTANTS  (must match game_logic.h)
+// ══════════════════════════════════════════════════════════════════════
+const STARTING_CREDITS = 500;
+const JUDGE_MAX_HP     = 2000;
+const ENRAGE_THRESHOLD = 600;
+const ENRAGE_MIN_BET   = 50;
+const MIN_BET          = 10;
+const LOW_MONEY        = 80;
+const SYM = { S:"♠", H:"♥", D:"♦", C:"♣" };
+
+// ══════════════════════════════════════════════════════════════════════
+// AUDIO ENGINE  (browser-only, not suitable for C++)
+// ══════════════════════════════════════════════════════════════════════
+let _ctx = null;
+const ac = () => { if (!_ctx) try { _ctx = new (window.AudioContext||window.webkitAudioContext)(); } catch(e){} return _ctx; };
+const tone = (f,d,t,v,dl=0) => {
+  try {
+    const c=ac(); if(!c) return; if(c.state==="suspended") c.resume();
+    const o=c.createOscillator(), g=c.createGain();
+    o.connect(g); g.connect(c.destination);
+    o.type=t||"sine"; o.frequency.value=f;
+    const ts=c.currentTime+dl;
+    g.gain.setValueAtTime(v||.2,ts); g.gain.exponentialRampToValueAtTime(.0001,ts+d);
+    o.start(ts); o.stop(ts+d+.05);
+  } catch(e){}
+};
+const SFX = {
+  card:    ()=>tone(1300,.06,"square",.09),
+  deal:    (i)=>tone(900+i*70,.07,"square",.08),
+  reveal:  ()=>{ tone(110,.9,"sawtooth",.13); tone(73,1.1,"sawtooth",.09,.35); },
+  draw:    ()=>{ tone(70,.14,"sine",.28); tone(55,.2,"sine",.17,.1); },
+  verdict: ()=>[90,80,70,55].forEach((f,i)=>tone(f,.3,"sine",.22,i*.15)),
+  win:     ()=>[523,659,784,1047].forEach((f,i)=>tone(f,.28,"sine",.2,i*.1)),
+  lose:    ()=>[220,196,165,130].forEach((f,i)=>tone(f,.4,"sawtooth",.16,i*.14)),
+  bust:    ()=>{ tone(140,.7,"sawtooth",.25); tone(100,.6,"sawtooth",.17,.25); },
+  betSet:  ()=>tone(440,.07,"sine",.10),
+  confirm: ()=>[440,550,660].forEach((f,i)=>tone(f,.12,"sine",.15,i*.06)),
+  lowMon:  ()=>[220,180].forEach((f,i)=>tone(f,.4,"sawtooth",.12,i*.2)),
+  enrage:  ()=>{ tone(55,1.2,"sawtooth",.35); tone(42,.9,"sawtooth",.22,.3); },
+  crit:    ()=>{ [880,1320,1760].forEach((f,i)=>tone(f,.18,"square",.18,i*.06)); tone(60,.6,"sawtooth",.28,.05); },
+  hb:      (fast)=>{ const d=fast?.35:.55; [0,1].forEach(i=>{ tone(fast?45:60,fast?.10:.08,fast?"sawtooth":"sine",fast?.45:.35,i*d); }); },
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// THEME
+// ══════════════════════════════════════════════════════════════════════
+const C = {
+  bg:"#08080c", panel:"#0d0d18", panelB:"#13132a",
+  red:"#c81e1e", redB:"#ff3c3c", redD:"#780f0f",
+  gold:"#d4af37", goldD:"#8c6e1e", goldB:"#f5d060",
+  white:"#f0ebdc", grey:"#a0a0aa", greyD:"#32323c",
+  green:"#1ec850", greenD:"#0a5a1e", cyan:"#1ec8d2",
+  shield:"#3264ff", border:"#3c0f0f", danger:"#ff6a00",
+  enrage:"#ff1a1a",
+};
+
+// ══════════════════════════════════════════════════════════════════════
+// CSS
+// ══════════════════════════════════════════════════════════════════════
+const CSS = `
+*{box-sizing:border-box;margin:0;padding:0}
+body,#root{background:${C.bg};min-height:100vh}
+.root{font-family:'Share Tech Mono',monospace;background:${C.bg};min-height:100vh;color:${C.white};display:flex;flex-direction:row;overflow:hidden;position:relative;user-select:none}
+.root.enrage{background:#0a0005}
+.scanlines{position:fixed;inset:0;pointer-events:none;z-index:100;background:repeating-linear-gradient(to bottom,transparent 0,transparent 4px,rgba(0,0,0,.018) 4px,rgba(0,0,0,.018) 5px)}
+.flash{position:fixed;inset:0;pointer-events:none;z-index:90}
+.fw{animation:fw .55s ease-out}.fl{animation:fl .55s ease-out}.fb{animation:fb .45s ease-out}.fc{animation:fc .7s ease-out}
+@keyframes fw{0%{background:rgba(30,200,80,.45)}100%{background:transparent}}
+@keyframes fl{0%{background:rgba(255,60,60,.55)}100%{background:transparent}}
+@keyframes fb{0%{background:rgba(200,30,30,.6)}100%{background:transparent}}
+@keyframes fc{0%{background:rgba(255,200,0,.6)}50%{background:rgba(255,60,60,.4)}100%{background:transparent}}
+@keyframes shake{0%,100%{transform:translate(0,0)}10%{transform:translate(-4px,2px)}30%{transform:translate(-6px,1px)}50%{transform:translate(-3px,-2px)}70%{transform:translate(-4px,-1px)}90%{transform:translate(-2px,-3px)}}
+@keyframes shakeSm{0%,100%{transform:translate(0,0)}25%{transform:translate(-2px,1px)}75%{transform:translate(2px,-1px)}}
+.shake{animation:shake .45s ease both}.shakeSm{animation:shakeSm .3s ease both}
+.hbWrap{position:fixed;inset:0;pointer-events:none;z-index:89;border:3px solid transparent}
+.hb17{animation:hb17 .9s ease-in-out infinite}.hb18{animation:hb18 .75s ease-in-out infinite}.hb19{animation:hb19 .6s ease-in-out infinite}.hb20{animation:hb20 .45s ease-in-out infinite}.hbEnr{animation:hbEnr .35s ease-in-out infinite}
+@keyframes hb17{50%{box-shadow:0 0 30px rgba(255,106,0,.25) inset}}
+@keyframes hb18{50%{box-shadow:0 0 40px rgba(255,106,0,.4) inset}}
+@keyframes hb19{50%{box-shadow:0 0 55px rgba(200,30,30,.5) inset}}
+@keyframes hb20{50%{box-shadow:0 0 70px rgba(200,30,30,.7) inset}}
+@keyframes hbEnr{50%{box-shadow:0 0 80px rgba(139,0,0,.65) inset}}
+/* LEFT PANEL */
+.lp{width:230px;flex-shrink:0;background:${C.panel};border-right:2px solid ${C.border};display:flex;flex-direction:column;padding:20px 16px 16px;gap:16px;position:relative;z-index:10}
+.lp::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,${C.redD},${C.redB},${C.redD})}
+.lp.enrage{border-right-color:${C.enrage}}.lp.enrage::before{background:linear-gradient(90deg,#5a0000,${C.enrage},#5a0000)}
+.av-block{display:flex;flex-direction:column;align-items:center;gap:8px;padding-bottom:16px;border-bottom:1px solid rgba(60,15,15,.6)}
+.av-frame{width:88px;height:88px;border-radius:4px;border:2px solid ${C.gold};background:${C.panelB};display:flex;align-items:center;justify-content:center;font-size:40px;box-shadow:0 0 12px rgba(212,175,55,.25)}
+.av-name{font-family:'Press Start 2P',monospace;font-size:10px;color:${C.white};letter-spacing:2px;text-align:center;line-height:1.6}
+.av-title{font-size:11px;color:${C.grey};letter-spacing:1px;text-align:center}
+.hp-sec{display:flex;flex-direction:column;gap:6px}
+.hp-row{display:flex;justify-content:space-between}.hp-lbl{font-size:11px;color:${C.grey};letter-spacing:2px}.hp-val{font-size:11px;color:${C.white}}
+.hp-out{height:12px;background:#1a1a24;border-radius:3px;overflow:hidden;border:1px solid #1e1e2e}
+.hp-in{height:100%;border-radius:2px;transition:width .8s cubic-bezier(.22,1,.36,1)}
+.hp-in.full{background:${C.green};box-shadow:0 0 8px ${C.green}}.hp-in.med{background:${C.gold};box-shadow:0 0 8px ${C.gold}}.hp-in.low{background:${C.redB};box-shadow:0 0 8px ${C.redB};animation:hpPulse .5s ease infinite alternate}
+@keyframes hpPulse{from{opacity:1}to{opacity:.6}}
+.money-box{background:${C.panelB};border:1px solid ${C.gold};border-radius:6px;padding:12px;display:flex;flex-direction:column;align-items:center;gap:4px;position:relative;overflow:hidden}
+.money-box::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,${C.gold},transparent);opacity:.6}
+.money-lbl{font-size:11px;color:#c8982a;letter-spacing:3px}
+.money-val{font-family:'Press Start 2P',monospace;font-size:18px;color:${C.gold};text-shadow:0 0 16px rgba(212,175,55,.7);transition:color .4s;line-height:1.3}
+.money-val.danger{color:${C.redB};text-shadow:0 0 20px rgba(255,60,60,.8);animation:mShake .4s ease}
+.money-val.gain{animation:mPop .5s cubic-bezier(.22,1,.36,1)}.money-val.loss{animation:mDrop .5s ease}
+@keyframes mShake{25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}
+@keyframes mPop{40%{transform:scale(1.18)}}@keyframes mDrop{40%{transform:translateY(4px)}}
+.money-delta{font-size:12px;letter-spacing:1px;min-height:18px;text-align:center}
+.money-delta.pos{color:${C.green}}.money-delta.neg{color:${C.redB}}.money-delta.zero{color:${C.grey}}
+.danger-warn{font-size:11px;color:${C.danger};letter-spacing:2px;text-align:center;animation:blink .4s step-end infinite}
+.streak-box{display:flex;flex-direction:column;align-items:center;gap:5px;padding:11px 8px 10px;background:${C.panelB};border-radius:4px;border:1px solid rgba(80,80,100,.5)}
+.streak-lbl{font-size:10px;color:${C.grey};letter-spacing:2px}
+.pips{display:flex;gap:7px;margin-top:4px}
+.pip{width:22px;height:22px;border-radius:3px;border:1px solid #484858;background:#2a2a38;transition:all .3s}
+.pip.lit{background:${C.gold};border-color:${C.goldB};box-shadow:0 0 8px ${C.gold}}
+.pip.bonus{background:${C.green};border-color:${C.green};box-shadow:0 0 10px ${C.green};animation:bonusPip .4s ease infinite alternate}
+@keyframes bonusPip{from{opacity:1}to{opacity:.5}}
+.streak-hint{font-size:10px;color:${C.grey};opacity:.7;text-align:center;letter-spacing:1px;margin-top:2px}
+.skills-sec{display:flex;flex-direction:column;gap:6px;flex:1}
+.skills-ttl{font-size:11px;color:#707080;letter-spacing:2px;padding-bottom:4px;border-bottom:1px solid ${C.greyD}}
+.sk-card{background:rgba(30,200,210,.07);border:1px solid rgba(30,200,210,.35);border-radius:5px;padding:8px 10px;cursor:default;transition:all .15s}
+.sk-card.usable{cursor:pointer;border-color:${C.cyan};background:rgba(30,200,210,.13)}.sk-card.usable:hover{background:rgba(30,200,210,.25);transform:translateX(2px)}
+.sk-name{font-size:10px;color:${C.cyan};letter-spacing:1px}.sk-desc{font-size:9px;color:${C.grey};margin-top:3px;line-height:1.5}
+.sk-empty{font-size:10px;color:${C.greyD};text-align:center;padding:8px 0;letter-spacing:1px}
+.round-badge{text-align:center;font-size:10px;color:#565668;letter-spacing:2px;padding-top:8px;border-top:1px solid ${C.greyD}}
+/* RIGHT PANEL */
+.rp{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden}
+/* JUDGE HP BAR — redesigned */
+.jbar{flex-shrink:0;background:rgba(8,4,12,.97);border-bottom:2px solid #3a003a;padding:14px 24px 14px;position:relative;z-index:15}
+.jbar.enrage{border-bottom-color:${C.enrage};background:rgba(18,0,4,.98)}
+.jbar-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.jbar-left{display:flex;flex-direction:column;gap:3px}
+.jbar-name{font-family:'Press Start 2P',monospace;font-size:9px;letter-spacing:3px;color:${C.redB};text-shadow:0 0 10px ${C.red}}
+.jbar-name.enrage{color:${C.enrage};text-shadow:0 0 18px ${C.enrage};animation:enrFlicker .25s step-end infinite}
+@keyframes enrFlicker{0%,90%{opacity:1}91%,95%{opacity:.4}96%{opacity:1}}
+.jbar-phase{font-size:10px;letter-spacing:2px;color:#780f0f}
+.jbar-phase.enrage{color:${C.enrage};animation:blink .4s step-end infinite}
+.jbar-right{display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.jbar-hp-num{font-family:'Press Start 2P',monospace;font-size:14px;color:${C.redB};line-height:1}
+.jbar-hp-num.enrage{color:${C.enrage};text-shadow:0 0 10px ${C.enrage}}
+.jbar-hp-max{font-size:10px;color:#5a2020;letter-spacing:1px}
+.jbar-wrap{display:flex;flex-direction:column;gap:5px}
+.jbar-track{width:100%;height:18px;background:rgba(30,8,8,.9);border:1px solid #3c0f0f;border-radius:2px;overflow:hidden;position:relative}
+.jbar-fill{height:100%;border-radius:1px;transition:width 1s cubic-bezier(.22,1,.36,1),background .8s;position:relative;overflow:hidden}
+.jbar-fill.high{background:linear-gradient(90deg,#3d007a,#6a00c8,#8b00ff)}
+.jbar-fill.mid{background:linear-gradient(90deg,#780f0f,${C.red},#c83030)}
+.jbar-fill.low{background:linear-gradient(90deg,#4a0000,#aa1a1a,${C.redB})}
+.jbar-fill.enrage{background:linear-gradient(90deg,#660000,#cc0000,${C.enrage});animation:enrHp .35s ease-in-out infinite alternate}
+@keyframes enrHp{from{filter:brightness(.85)}to{filter:brightness(1.2)}}
+.jbar-fill::after{content:'';position:absolute;top:0;left:0;right:0;height:40%;background:rgba(255,255,255,.07);pointer-events:none}
+.jbar-fill-shine{position:absolute;top:0;left:-60%;width:40%;height:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.12),transparent);animation:hpShine 3.5s ease-in-out infinite}
+@keyframes hpShine{0%,100%{left:-60%}50%{left:110%}}
+.jbar-segs{position:absolute;inset:0;display:flex;pointer-events:none}
+.jbar-seg{flex:1;border-right:1px solid rgba(0,0,0,.35)}
+.jbar-seg:last-child{border-right:none}
+.jbar-milestones{display:flex;justify-content:space-between;padding:0 2px;margin-top:2px}
+.jbar-ms{font-size:9px;color:#5a2020;letter-spacing:1px;position:relative}
+.jbar-ms.passed{color:#3a1515}
+.jbar-ms.active{color:${C.redB}}
+.jbar-ms.enrage-ms{color:${C.enrage};animation:blink .45s step-end infinite}
+.p2-badge{display:inline-block;margin-left:8px;font-family:'Press Start 2P',monospace;font-size:7px;background:${C.enrage};color:#000;padding:2px 6px;border-radius:1px}
+.enr-warn{font-size:10px;letter-spacing:3px;color:${C.enrage};text-align:center;margin-top:6px;animation:blink .35s step-end infinite}
+.heal-float{position:absolute;right:16px;top:2px;font-family:'Press Start 2P',monospace;font-size:11px;color:#00ff99;text-shadow:0 0 10px #00ff99;animation:healUp 2.2s ease-out forwards;pointer-events:none;z-index:20}
+@keyframes healUp{0%{opacity:0;transform:translateY(8px)}15%{opacity:1}80%{opacity:1;transform:translateY(-16px)}100%{opacity:0;transform:translateY(-28px)}}
+/* TOPBAR */
+.topbar{background:${C.panelB};border-bottom:2px solid ${C.border};padding:8px 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.title{font-family:'Press Start 2P',monospace;font-size:9px;color:${C.redB};letter-spacing:2px;text-shadow:0 0 16px ${C.red}}
+.bet-badge{background:rgba(120,15,15,.4);border:1px solid ${C.redD};border-radius:4px;padding:4px 12px;text-align:center}
+.bet-badge.enrage{border-color:${C.enrage}}.bet-badge-lbl{font-size:10px;color:${C.redD};letter-spacing:2px}
+.bet-badge-val{font-size:16px;font-family:'Press Start 2P',monospace;color:${C.redB}}.bet-badge.enrage .bet-badge-val{color:${C.enrage}}
+/* MAIN AREA */
+.main{flex:1;display:flex;flex-direction:column;align-items:center;padding:14px 20px 18px;gap:10px;position:relative;overflow-y:auto}
+/* ZONES */
+.jzone,.pzone{width:100%;max-width:680px;background:${C.panelB};border-radius:10px;padding:14px 18px;position:relative;overflow:hidden}
+.jzone{border:1px solid ${C.redD};transition:border-color .3s,box-shadow .3s}
+.jzone.tense{border-color:${C.redB}!important;animation:heartbeat .8s ease-in-out infinite}
+@keyframes heartbeat{0%,100%{box-shadow:0 0 20px rgba(200,30,30,.35)}50%{box-shadow:0 0 50px rgba(255,60,60,.7)}}
+.jzone.enrage{border-color:${C.enrage}!important;animation:enrZone .4s ease-in-out infinite}
+@keyframes enrZone{0%,100%{box-shadow:0 0 25px rgba(255,26,26,.4)}50%{box-shadow:0 0 60px rgba(255,26,26,.75)}}
+.pzone{border:1px solid ${C.goldD}}.pzone.shield{box-shadow:0 0 18px ${C.shield},0 0 5px ${C.shield} inset;border-color:${C.shield}!important}
+.tension-bar{position:absolute;top:0;left:0;right:0;height:3px;background:rgba(200,30,30,.12);overflow:hidden}
+.tension-fill{height:100%;background:linear-gradient(90deg,${C.redD},${C.redB});transition:width .6s ease;box-shadow:0 0 8px ${C.redB}}
+.zone-lbl{font-size:11px;letter-spacing:3px;margin-bottom:10px;display:flex;align-items:center;gap:10px;padding-top:4px}
+.zone-score{font-family:'Press Start 2P',monospace;font-size:17px;margin-left:auto}
+.judge-status{font-size:11px;letter-spacing:3px;color:${C.redB};animation:blink .5s step-end infinite;min-height:18px;margin-bottom:6px}
+.judge-status.enrage{color:${C.enrage}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+/* CARDS */
+.hand-row{display:flex;flex-wrap:wrap;gap:8px;min-height:108px;align-items:center}
+.card{width:68px;height:98px;border-radius:7px;display:flex;flex-direction:column;justify-content:space-between;padding:5px 6px;font-family:'Share Tech Mono',monospace;font-size:13px;flex-shrink:0;transition:transform .15s}
+.card:hover{transform:translateY(-4px)}
+.cface{background:#f0ebdc;border:1.5px solid #aaa;color:#111}.cface.red{color:${C.red}}
+.cback{background:${C.redD};border:1.5px solid ${C.border};overflow:hidden;position:relative}
+.cback-grid{position:absolute;inset:7px;border:1px solid ${C.red};border-radius:3px;display:grid;grid-template-columns:repeat(5,1fr);gap:2px;overflow:hidden}
+.cback-dot{background:${C.red};opacity:.28;border-radius:1px}
+.cr{font-size:14px;font-weight:bold;line-height:1}.cs{font-size:11px}.cc{font-size:24px;text-align:center;line-height:1}.crb{font-size:14px;font-weight:bold;line-height:1;text-align:right;transform:rotate(180deg)}
+@keyframes deal{from{opacity:0;transform:translateY(-28px) scale(.85) rotate(-3deg)}to{opacity:1;transform:none}}
+@keyframes reveal{0%{opacity:0;transform:scale(.35) rotate(-8deg);filter:brightness(4)}60%{transform:scale(1.12) rotate(1deg)}100%{opacity:1;transform:none}}
+@keyframes drawn{from{opacity:0;transform:translateX(42px) scale(.9)}to{opacity:1;transform:none}}
+@keyframes slowReveal{0%{opacity:0;transform:translateY(22px) scale(.88);filter:blur(2px)}70%{opacity:.9;transform:translateY(-3px) scale(1.04)}100%{opacity:1;transform:none;filter:none}}
+.ad{animation:deal .3s cubic-bezier(.22,1,.36,1)}.ar{animation:reveal .45s cubic-bezier(.22,1,.36,1)}.adr{animation:drawn .35s cubic-bezier(.22,1,.36,1)}.asr{animation:slowReveal .55s cubic-bezier(.22,1,.36,1) forwards}
+.crit-glow{animation:critGlow .7s ease-out forwards}
+@keyframes critGlow{30%{box-shadow:0 0 30px rgba(255,220,0,1),0 0 50px rgba(255,100,0,.6)}100%{box-shadow:0 0 6px rgba(255,220,0,.2)}}
+/* MIDDLE */
+.mid{width:100%;max-width:680px;display:flex;flex-direction:column;align-items:center;gap:50px}
+.msg-box{background:${C.panelB};border:1px solid rgba(240,235,220,.22);padding:14px 20px;font-size:15px;color:${C.white};letter-spacing:1px;width:100%;min-height:60px;line-height:1.7;white-space:pre-line;position:relative}
+.msg-box::after{content:'';position:absolute;top:-1px;left:-1px;width:10px;height:10px;border-top:2px solid rgba(240,235,220,.7);border-left:2px solid rgba(240,235,220,.7)}
+.msg-box.enrage{border-color:${C.enrage};background:#1a0005;color:#ffcccc}
+.msg-box::before{content:'* ';font-weight:bold}.msg-box.enrage::before{color:${C.enrage}}
+.cursor{display:inline-block;width:9px;height:17px;background:${C.white};margin-left:2px;animation:blink .55s step-end infinite;vertical-align:middle}
+.msg-box.enrage .cursor{background:${C.enrage}}
+.act-row{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+/* BUTTONS */
+.btn{font-family:'Press Start 2P',monospace;font-size:12px;letter-spacing:2px;padding:16px 28px;border-radius:0;cursor:pointer;border:2px solid transparent;transition:all .12s;white-space:nowrap}
+.btn:active{transform:scale(.93)}.btn:disabled{opacity:.3;cursor:not-allowed;transform:none}
+.btn-hit{background:#1e1e30;border-color:${C.goldB};color:${C.goldB};min-width:150px;font-size:14px;padding:18px 32px}
+.btn-hit:hover{background:#2e2e48;color:#fff;transform:translateY(-3px);box-shadow:0 6px 22px rgba(245,208,96,.35)}
+.btn-stand{background:${C.redD};border-color:${C.redB};color:#fff;min-width:150px;font-size:14px;padding:18px 32px}
+.btn-stand:hover{background:${C.red};transform:translateY(-3px);box-shadow:0 6px 22px rgba(255,60,60,.5)}
+.btn-bet{background:linear-gradient(180deg,#c9a227,#8c6e1e);border-color:${C.goldB};color:#000;padding:18px 40px;font-size:13px;width:100%;letter-spacing:3px}
+.btn-bet:hover{background:linear-gradient(180deg,${C.goldB},#c9a227);transform:translateY(-3px);box-shadow:0 6px 32px rgba(212,175,55,.65)}
+.btn-bet.enrage{background:#880000;border-color:${C.enrage};color:#ff9999;animation:enrBet .6s ease-in-out infinite}
+@keyframes enrBet{0%,100%{box-shadow:0 0 8px rgba(255,26,26,.4)}50%{box-shadow:0 0 24px rgba(255,26,26,.9)}}
+.btn-confirm{background:${C.greenD};border-color:${C.green};color:${C.green};padding:16px 36px;font-size:12px;animation:confPulse 1s ease infinite}
+@keyframes confPulse{50%{box-shadow:0 0 22px rgba(30,200,80,.6)}}.btn-confirm:hover{background:${C.green};color:#000;transform:translateY(-3px)}
+.btn-cancel{background:${C.greyD};border-color:${C.grey};color:${C.grey};padding:16px 24px;font-size:11px}
+.btn-cancel:hover{border-color:${C.redB};color:${C.redB};transform:translateY(-2px)}
+.btn-restart{background:${C.redD};border-color:${C.redB};color:${C.redB};font-size:11px;padding:16px 40px}
+.btn-restart:hover{background:${C.red};color:#fff;transform:translateY(-3px)}
+/* BET PANEL */
+.bet-panel{display:flex;flex-direction:column;align-items:center;gap:14px;padding:24px 20px 20px;background:${C.panelB};border:1px solid ${C.red};border-radius:4px;width:100%;max-width:520px;position:relative;animation:betIn .35s cubic-bezier(.22,1,.36,1)}
+.bet-panel.enrage{border-color:${C.enrage};background:rgba(25,0,5,.95)}
+@keyframes betIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+.bet-panel::before{content:'PLACE YOUR WAGER';position:absolute;top:-11px;left:50%;transform:translateX(-50%);background:${C.red};font-family:'Press Start 2P',monospace;font-size:9px;color:#fff;letter-spacing:3px;padding:2px 12px;white-space:nowrap}
+.bet-panel.enrage::before{content:'⚠ ENRAGE — WAGER ⚠';background:${C.enrage};color:#000}
+.bet-amt-box{display:flex;flex-direction:column;align-items:center;gap:4px;padding:14px 24px 12px;background:${C.bg};border:1px solid ${C.gold};border-radius:2px;width:100%}
+.bet-amt-lbl{font-size:10px;color:#8a8a96;letter-spacing:3px}
+.bet-amt-val{font-family:'Press Start 2P',monospace;font-size:28px;color:${C.goldB};text-shadow:0 0 20px rgba(245,208,96,.5);line-height:1.2;transition:transform .1s}
+.bet-amt-val.adj{animation:adjPop .15s ease}
+@keyframes adjPop{50%{transform:scale(1.08)}}
+.bet-pct{font-size:10px;color:#606070;margin-top:1px;letter-spacing:1px}
+.risk-track{height:12px;background:rgba(50,50,60,.85);border-radius:6px;overflow:visible;position:relative;border:1px solid rgba(255,255,255,.06);margin-bottom:4px}
+.risk-fill{height:100%;border-radius:6px;transition:width .3s,background .3s;position:relative}
+.risk-fill::after{content:'';position:absolute;right:-5px;top:50%;transform:translateY(-50%);width:14px;height:14px;border-radius:50%;background:currentColor;border:2px solid rgba(255,255,255,.35)}
+.risk-lbl{font-size:10px;letter-spacing:2px;text-align:right;width:100%}
+.adj-row{display:flex;gap:7px;flex-wrap:wrap;justify-content:center}
+.adj-row+.adj-row{padding-top:10px;border-top:1px solid rgba(255,255,255,.06);margin-top:2px}
+.adj-btn{background:rgba(50,50,60,.85);border:1px solid #505060;color:${C.white};border-radius:2px;padding:9px 16px;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:14px;transition:all .1s}
+.adj-btn:hover{background:#484858;border-color:${C.white};transform:translateY(-1px)}.adj-btn:active{transform:scale(.92)}
+.adj-btn.sp{border-color:${C.red};color:#ff6b6b;background:rgba(200,30,30,.1)}.adj-btn.sp:hover{border-color:${C.redB};background:rgba(200,30,30,.28);color:#fff}
+.enr-bet-warn{font-size:12px;letter-spacing:2px;color:${C.enrage};text-align:center;border:1px solid rgba(255,26,26,.4);padding:6px 12px;border-radius:2px;animation:blink .45s step-end infinite}
+.conf-panel{display:flex;flex-direction:column;align-items:center;gap:12px;padding:18px 24px;background:${C.panelB};border:2px solid ${C.gold};border-radius:4px;width:100%;max-width:480px;animation:confIn .3s cubic-bezier(.22,1,.36,1)}
+@keyframes confIn{from{opacity:0;transform:scale(.92)}to{opacity:1;transform:none}}
+.conf-ttl{font-family:'Press Start 2P',monospace;font-size:11px;color:${C.gold};letter-spacing:3px;text-align:center}
+.conf-amt{font-family:'Press Start 2P',monospace;font-size:26px;color:${C.gold};text-shadow:0 0 16px rgba(212,175,55,.7)}
+.conf-warn{font-size:12px;color:${C.grey};letter-spacing:1px;text-align:center;line-height:1.6}
+.conf-row{display:flex;gap:12px}
+/* TENSE BORDERS */
+.ht17{border-color:${C.danger}!important;animation:ht17 .9s ease-in-out infinite}
+.ht18{border-color:${C.danger}!important;animation:ht18 .7s ease-in-out infinite}
+.ht19{border-color:${C.redB}!important;animation:ht19 .5s ease-in-out infinite}
+.ht20{border-color:${C.redB}!important;animation:ht20 .35s ease-in-out infinite}
+@keyframes ht17{from{box-shadow:0 0 8px rgba(255,106,0,.3)}to{box-shadow:0 0 24px rgba(255,106,0,.7)}}
+@keyframes ht18{from{box-shadow:0 0 10px rgba(255,106,0,.35)}to{box-shadow:0 0 35px rgba(255,106,0,.85)}}
+@keyframes ht19{from{box-shadow:0 0 12px rgba(255,60,60,.4)}to{box-shadow:0 0 50px rgba(255,60,60,.9)}}
+@keyframes ht20{from{box-shadow:0 0 14px rgba(255,60,60,.5)}to{box-shadow:0 0 70px rgba(255,60,60,1)}}
+.sdanger{color:${C.redB}!important;animation:sFlash .4s ease infinite alternate}
+@keyframes sFlash{from{opacity:1}to{opacity:.45}}
+/* CRIT BANNER */
+.crit-banner{position:fixed;top:20%;left:50%;transform:translateX(-50%);z-index:200;font-family:'Press Start 2P',monospace;font-size:22px;letter-spacing:4px;color:#ffdd00;text-shadow:0 0 30px #ff6600,0 0 60px #ff3300;animation:critBanner .9s cubic-bezier(.22,1,.36,1) forwards;pointer-events:none;white-space:nowrap}
+@keyframes critBanner{0%{opacity:0;transform:translateX(-50%) scale(.4)}25%{opacity:1;transform:translateX(-50%) scale(1.2)}85%{opacity:1}100%{opacity:0;transform:translateX(-50%) translateY(-30px)}}
+/* OVERLAYS */
+.result-ov{position:fixed;inset:0;background:rgba(0,0,0,.9);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:50;gap:18px;animation:fadeIn .35s ease}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+.res-txt{font-family:'Press Start 2P',monospace;font-size:24px;letter-spacing:4px;text-align:center;text-shadow:0 0 30px currentColor;animation:resPop .4s cubic-bezier(.22,1,.36,1)}
+@keyframes resPop{0%{transform:scale(.5);opacity:0}70%{transform:scale(1.1)}100%{transform:none;opacity:1}}
+.res-sub{font-size:14px;color:${C.grey};letter-spacing:2px;text-align:center}
+.res-delta{font-family:'Press Start 2P',monospace;font-size:18px;letter-spacing:2px;text-align:center}
+.res-delta.pos{color:${C.green};text-shadow:0 0 16px ${C.green}}.res-delta.neg{color:${C.redB};text-shadow:0 0 16px ${C.redB}}.res-delta.zero{color:${C.grey}}
+.res-streak{background:rgba(30,200,80,.12);border:1px solid ${C.green};color:${C.green};border-radius:2px;padding:8px 20px;font-size:11px;letter-spacing:2px;text-align:center}
+.sk-notice{background:rgba(30,200,210,.12);border:1px solid ${C.cyan};color:${C.cyan};border-radius:2px;padding:12px 22px;font-size:11px;letter-spacing:2px;text-align:center;animation:pulse3 .5s ease 3}
+@keyframes pulse3{50%{opacity:.4}}
+.res-cont{font-size:11px;color:${C.greyD};letter-spacing:2px;text-align:center;animation:blink .8s step-end infinite}
+.res-jdmg{font-size:13px;letter-spacing:2px;text-align:center;padding:8px 20px;border-radius:2px;color:#bb88ff;border:1px solid rgba(139,0,255,.4)}
+.res-jdmg.enr{color:${C.enrage};border-color:rgba(255,26,26,.4)}
+.res-jheal{font-size:13px;letter-spacing:2px;text-align:center;padding:8px 20px;border-radius:2px;color:#00ff99;border:1px solid rgba(0,255,100,.35)}
+.gameover-ov,.victory-ov{position:fixed;inset:0;background:rgba(0,0,0,.96);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:55;gap:20px;animation:fadeIn .4s ease}
+.go-ttl{font-family:'Press Start 2P',monospace;font-size:20px;color:${C.redB};letter-spacing:4px;text-align:center;text-shadow:0 0 40px ${C.redB};animation:goAppear .6s cubic-bezier(.22,1,.36,1)}
+@keyframes goAppear{from{transform:scale(.3) rotate(-5deg);opacity:0}to{transform:none;opacity:1}}
+.go-sub,.v-sub{font-size:13px;color:${C.grey};letter-spacing:2px;text-align:center;line-height:1.8}
+.go-stat,.v-stat{font-family:'Press Start 2P',monospace;font-size:11px;color:${C.gold};letter-spacing:2px;text-align:center}
+.victory-ov{background:radial-gradient(ellipse at center,rgba(0,0,60,.97),rgba(0,0,20,.99))}
+.v-ttl{font-family:'Press Start 2P',monospace;font-size:22px;color:${C.goldB};letter-spacing:4px;text-align:center;text-shadow:0 0 40px ${C.gold};animation:victAppear .8s cubic-bezier(.22,1,.36,1)}
+@keyframes victAppear{from{transform:scale(.3) rotate(5deg);opacity:0}70%{transform:scale(1.05)}to{transform:none;opacity:1}}
+.shield-bar{font-size:12px;color:${C.shield};letter-spacing:2px;padding:7px 14px;border:1px solid ${C.shield};border-radius:2px;animation:shieldGlow .7s ease infinite alternate}
+@keyframes shieldGlow{from{box-shadow:0 0 5px ${C.shield}}to{box-shadow:0 0 14px ${C.shield}}}
+.info-bar{flex-shrink:0;background:rgba(13,13,24,.95);border-top:1px solid ${C.border};padding:5px 16px;font-size:10px;color:${C.greyD};letter-spacing:1px;text-align:center}
+.lrh{font-size:12px;letter-spacing:2px;text-align:center;padding:5px 12px;border-radius:2px;opacity:.8}
+.lrh.win{color:${C.green};border:1px solid rgba(30,200,80,.25)}.lrh.lose{color:${C.redB};border:1px solid rgba(255,60,60,.25)}.lrh.draw{color:${C.grey};border:1px solid rgba(160,160,170,.2)}
+.pcv{position:fixed;inset:0;pointer-events:none;z-index:5}
+/* LOADING */
+.loading{position:fixed;inset:0;background:#08080c;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;z-index:999}
+.loading-ttl{font-family:'Press Start 2P',monospace;font-size:12px;color:${C.redB};letter-spacing:3px;animation:blink .7s step-end infinite}
+.loading-sub{font-size:12px;color:${C.grey};letter-spacing:2px}
+/* INTRO POPUP */
+.intro-ov{position:fixed;inset:0;background:rgba(0,0,0,.93);display:flex;align-items:center;justify-content:center;z-index:200;animation:fadeIn .4s ease}
+.intro-box{background:#0d0d18;border:1px solid #3c0f0f;border-radius:4px;width:min(640px,92vw);padding:0;overflow:hidden;position:relative;box-shadow:0 0 60px rgba(200,30,30,.25)}
+.intro-box::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,#780f0f,#ff3c3c,#780f0f)}
+.intro-header{padding:28px 36px 20px;border-bottom:1px solid rgba(60,15,15,.8)}
+.intro-eyebrow{font-size:10px;letter-spacing:4px;color:#780f0f;margin-bottom:12px}
+.intro-title{font-family:'Press Start 2P',monospace;font-size:15px;color:#ff3c3c;letter-spacing:3px;line-height:1.7;text-shadow:0 0 18px rgba(200,30,30,.5)}
+.intro-body{padding:28px 36px 24px;min-height:180px;position:relative}
+.intro-pg{animation:introPgIn .45s cubic-bezier(.22,1,.36,1)}
+@keyframes introPgIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+.intro-pg-text{font-size:13px;color:#c8b89a;line-height:2;letter-spacing:.5px}
+.intro-pg-text em{color:#ff3c3c;font-style:normal;font-weight:bold}
+.intro-footer{padding:20px 36px 24px;display:flex;align-items:center;justify-content:space-between;border-top:1px solid rgba(60,15,15,.6)}
+.intro-dots{display:flex;gap:8px}
+.intro-dot{width:8px;height:8px;border-radius:50%;background:#3c0f0f;border:1px solid #780f0f;transition:all .3s}
+.intro-dot.active{background:#ff3c3c;border-color:#ff3c3c;box-shadow:0 0 6px rgba(255,60,60,.5)}
+.intro-btn{font-family:'Press Start 2P',monospace;font-size:10px;letter-spacing:2px;padding:12px 24px;background:linear-gradient(180deg,#c81e1e,#780f0f);border:1px solid #ff3c3c;color:#fff;cursor:pointer;transition:all .12s;border-radius:2px}
+.intro-btn:hover{background:linear-gradient(180deg,#ff3c3c,#c81e1e);transform:translateY(-2px);box-shadow:0 4px 16px rgba(255,60,60,.4)}
+.intro-btn:active{transform:scale(.95)}
+.intro-btn.final{background:linear-gradient(180deg,#1ec850,#0a5a1e);border-color:#1ec850;color:#fff;animation:confPulse 1s ease infinite}
+.intro-btn.final:hover{background:linear-gradient(180deg,#1ec850,#1a9a40);box-shadow:0 4px 20px rgba(30,200,80,.45)}
+@media(max-width:640px){.root{flex-direction:column}.lp{width:100%;flex-direction:row;flex-wrap:wrap;gap:10px;padding:12px}.av-block{flex-direction:row;gap:10px;align-items:center}.money-box,.streak-box{flex:1;min-width:120px}.skills-sec{width:100%}}
+`;
+
+// ══════════════════════════════════════════════════════════════════════
+// PARTICLES  (canvas visual — browser-only)
+// ══════════════════════════════════════════════════════════════════════
+function Particles({ enrage }) {
+  const ref=useRef(null), pts=useRef([]), raf=useRef(null);
+  useEffect(()=>{
+    const cv=ref.current; if(!cv) return;
+    const ctx=cv.getContext("2d");
+    const resize=()=>{ cv.width=window.innerWidth; cv.height=window.innerHeight; };
+    resize(); window.addEventListener("resize",resize);
+    function frame(){
+      ctx.clearRect(0,0,cv.width,cv.height);
+      if(Math.random()<(enrage?.7:.4)) pts.current.push({
+        x:Math.random()*cv.width, y:cv.height+5,
+        vx:(Math.random()-.5)*.7, vy:-(Math.random()*1.4+.4),
+        life:Math.random()*70+40, ml:110, sz:Math.random()*1.6+.6,
+        col:enrage?["#ff1a1a","#ff4400","#cc0000"][Math.floor(Math.random()*3)]:["#c81e1e","#ff3c3c","#d4af37"][Math.floor(Math.random()*3)]
+      });
+      pts.current=pts.current.filter(p=>p.life>0);
+      for(const p of pts.current){p.x+=p.vx;p.y+=p.vy;p.life--;ctx.globalAlpha=p.life/p.ml;ctx.fillStyle=p.col;ctx.beginPath();ctx.arc(p.x,p.y,p.sz,0,Math.PI*2);ctx.fill();}
+      ctx.globalAlpha=1; raf.current=requestAnimationFrame(frame);
+    }
+    frame();
+    return ()=>{ cancelAnimationFrame(raf.current); pts.current=[]; window.removeEventListener("resize",resize); };
+  },[enrage]);
+  return <canvas ref={ref} className="pcv"/>;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// CARD VIEW  (render data received from C++ via WASM)
+// ══════════════════════════════════════════════════════════════════════
+function CardView({ card, animCls, shield, slowReveal, crit }) {
+  const red = card.suit==="H"||card.suit==="D";
+  if (card.faceDown) return (
+    <div className={`card cback ${animCls||""}`}>
+      <div className="cback-grid">{Array(25).fill(0).map((_,i)=><div key={i} className="cback-dot"/>)}</div>
+    </div>
+  );
+  const cls = slowReveal?"asr":(animCls||"");
+  return (
+    <div className={`card cface${red?" red":""}${shield?" shield":""} ${cls}${crit?" crit-glow":""}`}>
+      <div><div className="cr">{card.rank}</div><div className="cs">{SYM[card.suit]}</div></div>
+      <div className="cc">{SYM[card.suit]}</div>
+      <div className="crb">{card.rank}</div>
+    </div>
+  );
+}
+
+// UI sub-components
+function HpBar({ money }) {
+  const pct=Math.max(0,Math.min(100,(money/STARTING_CREDITS)*100));
+  const cls=pct>50?"full":pct>20?"med":"low";
+  return (
+    <div className="hp-sec">
+      <div className="hp-row"><span className="hp-lbl">HP</span><span className="hp-val">{money}/{STARTING_CREDITS}</span></div>
+      <div className="hp-out"><div className={`hp-in ${cls}`} style={{width:`${pct}%`}}/></div>
+    </div>
+  );
+}
+
+function JudgeHpBar({ judgeHp, enrage, healFlash }) {
+  const pct = Math.max(0, Math.min(100, (judgeHp / JUDGE_MAX_HP) * 100));
+  const fillCls = enrage ? "enrage" : pct > 50 ? "high" : pct > 30 ? "mid" : "low";
+
+  // milestones: ENRAGE threshold + half
+  const milestones = [
+    { label: "ENRAGE", hp: ENRAGE_THRESHOLD, pct: (ENRAGE_THRESHOLD/JUDGE_MAX_HP)*100 },
+    { label: "HALF",   hp: JUDGE_MAX_HP/2,   pct: 50 },
+  ];
+
+  // 10 segments แบ่ง HP bar ให้อ่านง่าย
+  const segs = Array(10).fill(0);
+
+  return (
+    <div className={`jbar${enrage?" enrage":""}`} style={{position:"relative"}}>
+      <div className="jbar-hdr">
+        <div className="jbar-left">
+          <span className={`jbar-name${enrage?" enrage":""}`}>
+            ⚖ THE JUDGE{enrage&&<span className="p2-badge">PHASE 2</span>}
+          </span>
+          <span className={`jbar-phase${enrage?" enrage":""}`}>
+            {enrage ? "▸ ENRAGE ACTIVE" : pct > 50 ? "▸ PHASE 1" : "▸ CRITICAL ZONE"}
+          </span>
+        </div>
+        <div className="jbar-right">
+          <span className={`jbar-hp-num${enrage?" enrage":""}`}>¢{judgeHp.toLocaleString()}</span>
+          <span className="jbar-hp-max">/ ¢{JUDGE_MAX_HP.toLocaleString()}</span>
+        </div>
+      </div>
+
+      <div className="jbar-wrap">
+        {/* main bar */}
+        <div className="jbar-track">
+          <div className={`jbar-fill ${fillCls}`} style={{width:`${pct}%`}}>
+            <div className="jbar-fill-shine"/>
+          </div>
+          {/* segment dividers overlaid */}
+          <div className="jbar-segs">
+            {segs.map((_,i)=><div key={i} className="jbar-seg"/>)}
+          </div>
+          {/* milestone markers */}
+          {milestones.map(m=>(
+            <div key={m.label} style={{
+              position:"absolute", top:0, bottom:0,
+              left:`${m.pct}%`,
+              width:"2px",
+              background: m.label==="ENRAGE"
+                ? (enrage?"rgba(255,26,26,.9)":"rgba(255,26,26,.5)")
+                : "rgba(255,200,0,.35)",
+              zIndex:2,
+              pointerEvents:"none"
+            }}/>
+          ))}
+        </div>
+
+        {/* milestone labels below bar */}
+        <div style={{position:"relative",height:14}}>
+          {milestones.map(m=>(
+            <span key={m.label} style={{
+              position:"absolute",
+              left:`${m.pct}%`,
+              transform:"translateX(-50%)",
+              fontSize:9,
+              letterSpacing:1,
+              color: m.label==="ENRAGE"
+                ? (judgeHp<=ENRAGE_THRESHOLD?"#ff1a1a":"#7a2020")
+                : (judgeHp<=JUDGE_MAX_HP/2?"#7a6010":"#7a6010"),
+              whiteSpace:"nowrap"
+            }}>
+              {m.label==="ENRAGE"?"⚠ ENRAGE":"◆ HALF"}
+            </span>
+          ))}
+          {/* pct label far right */}
+          <span style={{position:"absolute",right:0,fontSize:10,color:enrage?C.enrage:"#5a2020",letterSpacing:1}}>
+            {Math.round(pct)}%
+          </span>
+        </div>
+      </div>
+
+      {enrage&&<div className="enr-warn">⚠ ENRAGE MODE — MIN BET ¢{ENRAGE_MIN_BET} ⚠</div>}
+      {healFlash>0&&<div className="heal-float">♥ +¢{healFlash} LIFE STEAL</div>}
+    </div>
+  );
+}
+
+function StreakPips({ wins }) {
+  const inCycle=wins%2, bonus=wins>0&&inCycle===0;
+  const nextBonus=[3,5,7].find(k=>k>wins);
+  return (
+    <div className="streak-box">
+      <span className="streak-lbl">WIN STREAK</span>
+      <div className="pips">
+        {[0,1].map(i=>{ const lit=inCycle>i||(bonus&&i<2); return <div key={i} className={`pip${lit?" lit":""}${bonus?" bonus":""}`}/>; })}
+      </div>
+      <div className="streak-hint">
+        {wins===0?"2 in a row = skill":bonus?"✦ SKILL EARNED!":nextBonus?`${nextBonus-wins} more → skill`:`streak: ${wins}`}
+      </div>
+    </div>
+  );
+}
+
+function RiskMeter({ bet, money }) {
+  const pct=Math.min(100,money>0?(bet/money)*100:100);
+  const bg=pct<30?C.green:pct<60?C.gold:C.redB;
+  return (
+    <div style={{width:"100%",display:"flex",flexDirection:"column",gap:6}}>
+      <div className="risk-track"><div className="risk-fill" style={{width:`${pct}%`,background:bg,color:bg}}/></div>
+      <div className="risk-lbl" style={{color:bg}}>{pct<30?"LOW RISK":pct<60?"MED RISK":"HIGH RISK"} — {Math.round(pct)}%</div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// APP — reads state from C++ via WASM, renders it as React UI
+// ══════════════════════════════════════════════════════════════════════
+function App() {
+  // gs = state snapshot from C++ GameEngine::stateJson()
+  const [gs, setGs]             = useState(null);
+  const [wasmReady, setWasmReady] = useState(false);
+  const [flash, setFlash]       = useState("");
+  const [tension, setTension]   = useState(0);
+  const [jStatus, setJStatus]   = useState("");
+  const [showResult, setShowResult] = useState(false);
+  const [newSkill, setNewSkill] = useState("");
+  const [anims, setAnims]       = useState({});
+  const [moneyAnim, setMoneyAnim] = useState("");
+  const [betAdj, setBetAdj]     = useState(false);
+  const [betAmount, setBetAmount] = useState(MIN_BET);
+  const [betConfirming, setBetConfirming] = useState(false);
+  const [playerScore, setPlayerScore] = useState(0);
+  const [slowIdx, setSlowIdx]   = useState(-1);
+  const [shakeClass, setShake]  = useState("");
+  const [showCrit, setShowCrit] = useState(false);
+  const [critIdx, setCritIdx]   = useState(-1);
+  const [healFlash, setHealFlash] = useState(0);
+  const [lastDelta, setLastDelta] = useState(null);
+  const [lastMult, setLastMult] = useState(1);
+  const [judgeRevealScore, setJudgeRevealScore] = useState(null); // null = ใช้ jScore ปกติ
+  const [showIntro, setShowIntro] = useState(true);
+  const [introPage, setIntroPage] = useState(0);
+
+  const gsRef=useRef(gs), busy=useRef(false), timers=useRef([]);
+  useEffect(()=>{ gsRef.current=gs; },[gs]);
+
+  const sleep = ms => new Promise(r=>{ const t=setTimeout(r,ms); timers.current.push(t); });
+  const addAnim = (k,cls) => { setAnims(p=>({...p,[k]:cls})); setTimeout(()=>setAnims(p=>{const n={...p};delete n[k];return n;}),700); };
+  const trigFlash = t => { setFlash(t); setTimeout(()=>setFlash(""),600); };
+  const trigMoney = t => { setMoneyAnim(t); setTimeout(()=>setMoneyAnim(""),600); };
+  const trigShake = big => { setShake(big?"shake":"shakeSm"); setTimeout(()=>setShake(""),500); };
+  const trigCrit  = () => { setShowCrit(true); setTimeout(()=>setShowCrit(false),1000); };
+
+  // Pull full state from C++ GameEngine singleton
+  const pull = () => { const s=GE.getState(); setGs(s); return s; };
+  const safeMsg = (s) => (s && s.message) ? s.message : "";
+
+  // Wait for Emscripten Module to be ready.
+  // Uses onRuntimeInitialized callback + polling fallback so it works
+  // regardless of whether the WASM finishes before or after React mounts.
+  useEffect(()=>{
+    let done = false;
+    function initGame() {
+      if (done) return;
+      done = true;
+      GE.newGame();
+      pull();
+      setBetAmount(MIN_BET);
+      setWasmReady(true);
+    }
+    function check() {
+      if (done) return;
+      if (typeof Module !== "undefined" &&
+          typeof Module.ccall === "function" &&
+          typeof Module._bj_new_game === "function") {
+        initGame();
+      } else {
+        setTimeout(check, 80);
+      }
+    }
+    if (typeof Module !== "undefined") {
+      if (typeof Module._bj_new_game === "function") {
+        initGame();
+      } else {
+        const prev = Module.onRuntimeInitialized;
+        Module.onRuntimeInitialized = function() {
+          if (typeof prev === "function") prev();
+          initGame();
+        };
+        setTimeout(check, 400);
+      }
+    } else {
+      check();
+    }
+  },[]);
+  // KEYBOARD
+  useEffect(()=>{
+    const h=e=>{
+      const ph=gsRef.current?.phase;
+      if(ph==="PLAYER_TURN"){ if(e.key==="h"||e.key==="H") playerHit(); if(e.key==="s"||e.key==="S") playerStand(); }
+      if(ph==="ROUND_OVER"&&e.key==="Enter") nextRound();
+      if((ph==="GAME_OVER"||ph==="VICTORY")&&(e.key==="r"||e.key==="R")) restart();
+      if(ph==="BETTING"){
+        if(!betConfirming){ if(e.key==="ArrowUp") adjBet(10); if(e.key==="ArrowDown") adjBet(-10); if(e.key==="Enter") requestBet(); }
+        else { if(e.key==="Enter") confirmBet(); if(e.key==="Escape") cancelBet(); }
+      }
+    };
+    window.addEventListener("keydown",h);
+    return ()=>window.removeEventListener("keydown",h);
+  });
+
+  if (!wasmReady) return (
+    <>
+      <style>{CSS}</style>
+      <div className="loading">
+        <div className="loading-ttl">LOADING ENGINE...</div>
+        <div className="loading-sub">Initialising WASM / C++ backend</div>
+      </div>
+    </>
+  );
+
+  const enrage = gs.judgeHp<=ENRAGE_THRESHOLD&&gs.judgeHp>0;
+  const effMin  = enrage?ENRAGE_MIN_BET:MIN_BET;
+  const isLow   = gs.money<=LOW_MONEY;
+
+  // BET
+  const adjBet = delta => {
+    if(busy.current||betConfirming) return;
+    const next=Math.max(effMin,Math.min(gs.money,betAmount+delta));
+    SFX.betSet(); setBetAdj(true); setTimeout(()=>setBetAdj(false),180);
+    if(gs.money<=LOW_MONEY) SFX.lowMon();
+    setBetAmount(next);
+  };
+  const setBetQ = ratio => {
+    if(busy.current||betConfirming) return;
+    const amt=Math.max(effMin,Math.min(gs.money,Math.floor(gs.money*ratio)));
+    SFX.betSet(); setBetAdj(true); setTimeout(()=>setBetAdj(false),180);
+    setBetAmount(amt);
+  };
+  const requestBet = () => {
+    if(busy.current||betAmount<effMin||betAmount>gs.money) return;
+    SFX.betSet(); setBetConfirming(true);
+  };
+  const cancelBet = () => { if(busy.current) return; setBetConfirming(false); GE.cancelBet(); };
+
+  // DEAL — calls C++ placeBet + deal, reads back state card-by-card for animation
+  const confirmBet = async () => {
+    if(busy.current||betAmount<effMin||betAmount>gs.money) return;
+    busy.current=true; SFX.confirm(); setBetConfirming(false);
+    GE.placeBet(betAmount);
+    const enrNow = enrage;
+    if(enrNow) trigShake(true);
+    setTension(0); setJStatus(""); setShowResult(false); setNewSkill(""); setSlowIdx(-1); setPlayerScore(0); setCritIdx(-1);
+    // C++ deals 4 cards and advances to PLAYER_TURN
+    GE.deal(); let s=pull();
+    // animate cards appearing one by one with flip animation
+    setGs({...s,playerHand:[],judgeHand:[]});
+    await sleep(200); SFX.deal(0); setGs({...s,playerHand:[s.playerHand[0]],judgeHand:[]}); addAnim("p-0","ar");
+    await sleep(350); SFX.deal(1); setGs({...s,playerHand:s.playerHand.slice(0,2),judgeHand:[]}); addAnim("p-1","ar");
+    await sleep(350); SFX.deal(2); setGs({...s,playerHand:s.playerHand.slice(0,2),judgeHand:[s.judgeHand[0]]}); addAnim("j-0","ar");
+    await sleep(350); SFX.deal(3); setGs(s); addAnim("j-1","ar");
+    const ps = s.playerHand.reduce((t,c)=>{let v=c.value;if(t+v>21&&c.rank==="A")v=1;return t+v;},0);
+    setPlayerScore(ps);
+    if(s.playerHand.length===2&&ps===21){ SFX.crit(); setCritIdx(1); setTimeout(()=>setCritIdx(-1),1000); }
+    busy.current=false;
+  };
+
+  // HIT — calls C++ playerHit, reads result
+  const playerHit = async () => {
+    if(!gs||gs.phase!=="PLAYER_TURN"||busy.current) return;
+    busy.current=true;
+    const prevLen=gs.playerHand.length, enrNow=enrage;
+    if(playerScore>=17){
+      SFX.hb(enrNow);
+      await sleep(enrNow?150:200);
+    }
+    SFX.preRev?.(); SFX.card();
+    GE.playerHit(); const s=pull();
+    const idx=prevLen;
+    setGs({...s, playerHand: s.playerHand.slice(0, prevLen)});
+    await sleep(80);
+    setGs(s); addAnim(`p-${idx}`,"ar");
+    const sc = s.playerHand.reduce((t,c,i)=>{ if(c.faceDown) return t; let v=c.value; if(t+v>21&&c.rank==="A")v=1; return t+v; },0);
+    setPlayerScore(sc);
+    if(s.phase==="JUDGE_REVEAL"){ // busted
+      SFX.bust(); trigFlash("fb"); trigShake(enrNow);
+      setPlayerScore(0); await sleep(600); await runJudge(s);
+    } else {
+      busy.current=false;
+    }
+  };
+
+  // STAND — calls C++ playerStand
+  const playerStand = async () => {
+    if(!gs||gs.phase!=="PLAYER_TURN"||busy.current) return;
+    busy.current=true;
+    setPlayerScore(0); GE.playerStand(); pull();
+    await sleep(300); await runJudge(gsRef.current);
+  };
+
+  // คำนวณ score จาก hand array (รองรับ Ace 1/11)
+  const calcScore = (hand) => {
+    let total = 0, aces = 0;
+    for(const c of hand){ if(c.faceDown) continue; total += c.value; if(c.rank==="A") aces++; }
+    while(total > 21 && aces > 0){ total -= 10; aces--; }
+    return total;
+  };
+
+  // JUDGE SEQUENCE — เปิดการ์ดทีละใบ อัปเดต score สดๆ
+  const runJudge = async (prevS) => {
+    const enrNow = (prevS?.judgeHp||gs?.judgeHp||JUDGE_MAX_HP)<=ENRAGE_THRESHOLD;
+    const fast = enrNow;
+    setJudgeRevealScore(null);
+    setJStatus(fast?"▶  THE JUDGE RISES...":"▶  THE JUDGE AWAKENS...");
+    SFX.reveal(); if(fast) trigShake(true);
+    setTension(12); await sleep(fast?900:1300);
+
+    // ── ขั้น 1: เปิดใบที่ 2 (hidden card) ──────────────────────────────
+    setJStatus("▶  SCANNING HAND..."); setTension(32);
+    const curS = gsRef.current;
+    if(curS && curS.judgeHand.length >= 2) {
+      // อัปเดต UI: เปลี่ยนใบ faceDown → faceUp
+      const revealedHand = [curS.judgeHand[0], {...curS.judgeHand[1], faceDown:false}];
+      setGs({...curS, judgeHand: revealedHand});
+      addAnim("j-1","ar"); SFX.card();
+      // แสดง score หลัง reveal ใบที่ 2
+      const scoreAfterReveal = calcScore(revealedHand);
+      await sleep(fast?300:500);
+      setJudgeRevealScore(scoreAfterReveal);
+      await sleep(fast?350:550);
+    }
+
+    // ── ขั้น 2: C++ draw ทั้งหมดในคราวเดียว แล้ว animate ทีละใบ ────────
+    setJStatus(fast?"▶  JUDGE STRIKES...":"▶  JUDGE DRAWS..."); SFX.draw();
+    setTension(60);
+
+    // เรียก C++ ครั้งเดียว — ได้ final hand ทั้งหมด
+    const outcome = GE.runJudgeTurn();
+    const s = pull();
+
+    // เริ่มจาก 2 ใบ แล้วค่อยๆ เพิ่มทีละใบ
+    const baseHand = s.judgeHand.slice(0, 2);
+    setGs({...curS, judgeHand: baseHand});
+
+    for(let i = 2; i < s.judgeHand.length; i++){
+      await sleep(fast?450:600);
+      const partialHand = s.judgeHand.slice(0, i+1);
+      setGs(prev => ({...prev, judgeHand: partialHand}));
+      addAnim(`j-${i}`,"adr"); SFX.card();
+      // อัปเดต score หลังแต่ละใบ
+      const scoreNow = calcScore(partialHand);
+      await sleep(fast?200:300);
+      setJudgeRevealScore(scoreNow);
+      if(scoreNow > 21){ // bust ทันที
+        SFX.bust(); await sleep(fast?250:350);
+        break;
+      }
+    }
+
+    // ── ขั้น 3: สรุปผล ───────────────────────────────────────────────
+    setTension(100);
+    setJStatus("▶  CALCULATING VERDICT..."); SFX.verdict();
+    await sleep(fast?600:900);
+    setGs(s); // sync state ให้ครบ
+    setJudgeRevealScore(null); // กลับไปใช้ jScore ปกติ
+
+    const wasEnr=(prevS?.judgeHp||JUDGE_MAX_HP)<=ENRAGE_THRESHOLD;
+    const nowEnr=s.judgeHp<=ENRAGE_THRESHOLD&&s.judgeHp>0;
+
+    if(outcome.critHit){ SFX.crit(); trigCrit(); trigFlash("fc"); trigShake(true);
+      if(outcome.result==="PLAYER_WIN"){ setCritIdx(s.playerHand.length-1); setTimeout(()=>setCritIdx(-1),1200); }
+    } else if(outcome.result==="PLAYER_WIN"){ SFX.win(); trigFlash("fw"); trigMoney("gain"); }
+    else if(outcome.result==="JUDGE_WIN"){ SFX.lose(); trigFlash("fl"); trigMoney("loss"); if(s.money<=LOW_MONEY) trigShake(true); }
+
+    if(outcome.result==="JUDGE_WIN"&&outcome.judgeHpDelta>0){
+      setHealFlash(outcome.judgeHpDelta); setTimeout(()=>setHealFlash(0),2400);
+    }
+    if(!wasEnr&&nowEnr){ await sleep(200); SFX.enrage(); trigShake(true); trigFlash("fl"); }
+
+    setLastDelta(outcome.creditDelta); setLastMult(outcome.streakMultiplier);
+    setJStatus(""); await sleep(200); setTension(0); setShowResult(true);
+    if(outcome.newSkillName) setNewSkill(outcome.newSkillName);
+    busy.current=false;
+  };
+
+  // SKILL — calls C++ useSkill, pull result
+  const useSkill = i => {
+    if(!gs||gs.phase!=="PLAYER_TURN"||busy.current) return;
+    SFX.card(); GE.useSkill(i); pull(); setGs({...GE.getState()});
+  };
+
+  // NEXT ROUND
+const nextRound = () => {
+  if(busy.current) return;
+  GE.nextRound();  // ← เพิ่มบรรทัดนี้! บอก C++ ให้กลับไป BETTING
+  setShowResult(false); setNewSkill(""); setTension(0); setJStatus(""); 
+  setSlowIdx(-1); setPlayerScore(0); setCritIdx(-1); setJudgeRevealScore(null);
+  const enrNow = gsRef.current?.judgeHp <= ENRAGE_THRESHOLD;
+  setBetAmount(Math.max(enrNow ? ENRAGE_MIN_BET : MIN_BET, 
+    Math.min(betAmount, gsRef.current?.money || MIN_BET)));
+  setBetConfirming(false); 
+  setGs({...GE.getState()});  // pull state หลัง C++ reset แล้ว
+};
+
+  // RESTART
+  const restart = () => {
+    timers.current.forEach(clearTimeout); timers.current=[]; busy.current=false;
+    setShowResult(false); setNewSkill(""); setTension(0); setJStatus(""); setFlash(""); setMoneyAnim("");
+    setPlayerScore(0); setSlowIdx(-1); setShake(""); setCritIdx(-1); setShowCrit(false); setHealFlash(0);
+    setLastDelta(null); setLastMult(1); setBetConfirming(false); setJudgeRevealScore(null);
+    GE.newGame(); const s=pull(); setBetAmount(MIN_BET); setGs(s);
+  };
+
+
+
+  const INTRO_PAGES = [
+    {
+      eyebrow: "CLASSIFIED — SECTOR 7 TRIBUNAL",
+      title: "THE JUDGMENT PROTOCOL",
+      text: <>The world has withered. Resources are a ghost of the past, and the population is a burden the state can no longer bear.<br/><br/>Welcome to <em>JUDGMENT DAY</em>.</>
+    },
+    {
+      eyebrow: "YOUR STATUS: SELECTED",
+      title: "STAND BEFORE THE JUDGE",
+      text: <>You have been <em>selected</em>. You stand before <em>THE JUDGE</em> — a cold, unyielding system designed to cull the herd.<br/><br/>Your fate is not decided by trial, but by the cards.</>
+    },
+    {
+      eyebrow: "THE PROTOCOL",
+      title: "RULES OF ENGAGEMENT",
+      text: <>The rules of <em>Blackjack</em> — the ancient game of twenty-one — are the only barrier between your continued existence and <em>total erasure</em> from the system.<br/><br/>Win, and you earn your <em>liberation</em>. Lose, and you are <em>terminated</em>.</>
+    },
+    {
+      eyebrow: "INITIATING SESSION...",
+      title: "PLAY TO SURVIVE.",
+      text: <>The deck is shuffled. The Judge is watching.<br/><br/>Defeat <em>THE JUDGE</em> before your credits run dry — or be erased from the system forever.<br/><br/>Will you beat the odds, or will you be the next casualty of the protocol?</>
+    },
+  ];
+
+  if(showIntro) {
+    const pg = INTRO_PAGES[introPage];
+    const isLast = introPage === INTRO_PAGES.length - 1;
+    const advance = () => {
+      if(isLast){ setShowIntro(false); }
+      else { setIntroPage(p=>p+1); }
+    };
+    return (
+      <>
+        <style>{CSS}</style>
+        <div className="intro-ov" onClick={e=>{if(e.target===e.currentTarget) advance();}}>
+          <div className="intro-box">
+            <div className="intro-header">
+              <div className="intro-eyebrow">{pg.eyebrow}</div>
+              <div className="intro-title">{pg.title}</div>
+            </div>
+            <div className="intro-body">
+              <div className="intro-pg" key={introPage}>
+                <p className="intro-pg-text">{pg.text}</p>
+              </div>
+            </div>
+            <div className="intro-footer">
+              <div className="intro-dots">
+                {INTRO_PAGES.map((_,i)=><div key={i} className={`intro-dot${i===introPage?" active":""}`}/>)}
+              </div>
+              <button className={`intro-btn${isLast?" final":""}`} onClick={advance}>
+                {isLast ? "▶ BEGIN SESSION" : "NEXT ▶"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  // DERIVED
+  const pScore = gs.playerHand.filter(c=>!c.faceDown).reduce((t,c)=>t+c.value,0);
+  const _jScoreRaw = gs.judgeHand.filter(c=>!c.faceDown).reduce((t,c,_,arr)=>{
+    let v=c.value; return t+v;
+  },0);
+  // ใช้ judgeRevealScore ระหว่าง animation เพื่อแสดง score ที่ค่อยๆ เพิ่มทีละใบ
+  const jScore = judgeRevealScore !== null ? judgeRevealScore : _jScoreRaw;
+  const showJScore = !["BETTING","PLAYER_TURN","DEALING"].includes(gs.phase);
+  const isTense = gs.phase==="JUDGE_REVEAL"||gs.phase==="JUDGE_TURN";
+  const hbCls=(()=>{ if(enrage) return "hbEnr"; if(gs.phase!=="PLAYER_TURN") return ""; return playerScore>=20?"hb20":playerScore>=19?"hb19":playerScore>=18?"hb18":playerScore>=17?"hb17":""; })();
+  const pZoneCls=(()=>{ if(gs.phase!=="PLAYER_TURN") return ""; return playerScore>=20?"ht20":playerScore>=19?"ht19":playerScore>=18?"ht18":playerScore>=17?"ht17":""; })();
+  const RES={PLAYER_WIN:{t:"SURVIVAL CONFIRMED",c:C.green},JUDGE_WIN:{t:"ELIMINATED",c:C.redB},DRAW:{t:"STALEMATE",c:C.grey}};
+  const multLbl=lastMult>1?` (×${lastMult} STREAK!)` : "";
+  const lrhCls=lastDelta===null?"":(lastDelta>0?"win":lastDelta<0?"lose":"draw");
+  const lrhTxt=lastDelta===null?"":(lastDelta>0?`▲ LAST: +¢${lastDelta}`:lastDelta<0?`▼ LAST: -¢${Math.abs(lastDelta)}`:"— LAST: DRAW —");
+  function jCardAnim(c,i){ return anims[`j-${i}`]||""; }
+
+  return (
+    <>
+      <style>{CSS}</style>
+      <Particles enrage={enrage}/>
+      <div className="scanlines"/>
+      <div className={`flash ${flash}`}/>
+      <div className={`hbWrap ${hbCls}`}/>
+      {showCrit&&<div className="crit-banner">⚡ CRITICAL HIT — 1.5× DAMAGE ⚡</div>}
+
+      <div className={shakeClass} style={{minHeight:"100vh",display:"flex",flexDirection:"column"}}>
+      <div className={`root${enrage?" enrage":""}`}>
+
+        {/* ── LEFT PANEL ── */}
+        <div className={`lp${enrage?" enrage":""}`}>
+          <div className="av-block">
+            <div className="av-frame">{enrage?"💀":"🃏"}</div>
+            <div>
+              <div className="av-name">CITIZEN<br/>UNIT-001</div>
+              <div className="av-title">{gs.consecutiveWins>=7?"LEGENDARY":gs.consecutiveWins>=5?"CHAMPION":gs.consecutiveWins>=3?"SURVIVOR":"SUBJECT"}</div>
+            </div>
+          </div>
+          <HpBar money={gs.money}/>
+          <div className="money-box">
+            <div className="money-lbl">CREDITS</div>
+            <div className={`money-val${isLow?" danger":""} ${moneyAnim}`}>¢{gs.money}</div>
+            <div className={`money-delta ${lastDelta>0?"pos":lastDelta<0?"neg":"zero"}`}>
+              {lastDelta!==null&&lastDelta!==0?(lastDelta>0?`+¢${lastDelta}${multLbl}`:`-¢${Math.abs(lastDelta)}`):(lastDelta===null?"\u00A0":"¢0 stalemate")}
+            </div>
+            {isLow&&<div className="danger-warn">⚠ LOW FUNDS ⚠</div>}
+          </div>
+          <StreakPips wins={gs.consecutiveWins}/>
+          <div className="skills-sec">
+            <div className="skills-ttl">SKILLS</div>
+            {gs.skills.length===0
+              ?<div className="sk-empty">— none acquired —</div>
+              :gs.skills.map((sk,i)=>(
+                <div key={i} className={`sk-card${gs.phase==="PLAYER_TURN"?" usable":""}`} onClick={()=>useSkill(i)} title={sk.desc}>
+                  <div className="sk-name">◈ {sk.name}</div>
+                  <div className="sk-desc">{sk.desc}</div>
+                </div>
+              ))
+            }
+          </div>
+          <div className="round-badge">ROUND {gs.round}</div>
+        </div>
+
+        {/* ── RIGHT PANEL ── */}
+        <div className="rp">
+          <JudgeHpBar judgeHp={gs.judgeHp} enrage={enrage} healFlash={healFlash}/>
+          <div className="topbar">
+            <div className="title">◈ BLACKJACK: JUDGMENT DAY ◈</div>
+            {gs.bet>0&&gs.phase!=="BETTING"&&(
+              <div className={`bet-badge${enrage?" enrage":""}`}>
+                <div className="bet-badge-lbl">BET</div>
+                <div className="bet-badge-val">¢{gs.bet}</div>
+              </div>
+            )}
+          </div>
+          <div className="main">
+
+            {/* JUDGE HAND */}
+            {gs.phase!=="BETTING"&&(
+              <div className={`jzone${isTense?" tense":""}${enrage?" enrage":""}`}>
+                <div className="tension-bar"><div className="tension-fill" style={{width:`${tension}%`}}/></div>
+                <div className="zone-lbl" style={{color:enrage?C.enrage:C.red,paddingTop:6}}>
+                  ▲ THE JUDGE
+                  <span className="zone-score" style={{color:
+                    (judgeRevealScore!==null?judgeRevealScore:jScore)>21?C.grey
+                    :enrage?C.enrage:C.redB}}>
+                    {showJScore
+                      ? (judgeRevealScore!==null
+                          ? <>{judgeRevealScore}{judgeRevealScore>21&&" BUST"}</>
+                          : <>{jScore}{jScore>21&&" BUST"}</>)
+                      : "??"}
+                  </span>
+                </div>
+                {jStatus&&<div className={`judge-status${enrage?" enrage":""}`}>{jStatus}</div>}
+                <div className="hand-row">
+                  {gs.judgeHand.map((c,i)=><CardView key={`j-${i}-${c.faceDown?"h":"v"}-${c.rank}${c.suit}`} card={c} animCls={jCardAnim(c,i)}/>)}
+                  {gs.judgeHand.length===0&&<span style={{color:C.greyD,fontSize:11,letterSpacing:2}}>AWAITING DEAL</span>}
+                </div>
+              </div>
+            )}
+
+            {/* MIDDLE */}
+            <div className="mid">
+              <div className={`msg-box${enrage?" enrage":""}`}>
+                {(gs.message||"").replace(/^\* /,"")}<span className="cursor"/>
+              </div>
+
+              {/* BETTING */}
+              {gs.phase==="BETTING"&&!betConfirming&&(
+                <div className={`bet-panel${enrage?" enrage":""}`}>
+                  {lrhTxt&&<div className={`lrh ${lrhCls}`}>{lrhTxt}</div>}
+                  <div className="bet-amt-box">
+                    <div className="bet-amt-lbl">WAGER</div>
+                    <div className={`bet-amt-val${betAdj?" adj":""}`}>¢{betAmount}</div>
+                    <div className="bet-pct">{Math.round((betAmount/gs.money)*100)}% of funds</div>
+                  </div>
+                  <RiskMeter bet={betAmount} money={gs.money}/>
+                  <div className="adj-row">
+                    {[-50,-10,10,50].map(d=><button key={d} className="adj-btn" onClick={()=>adjBet(d)}>{d>0?`+${d}`:d}</button>)}
+                  </div>
+                  <div className="adj-row">
+                    {[0.25,0.5,0.75].map(r=><button key={r} className="adj-btn sp" onClick={()=>setBetQ(r)}>{Math.round(r*100)}%</button>)}
+                    <button className="adj-btn sp" onClick={()=>setBetQ(1.0)}>ALL IN</button>
+                  </div>
+                  {enrage&&<div className="enr-bet-warn">⚠ ENRAGE: MIN BET IS ¢{ENRAGE_MIN_BET} ⚠</div>}
+                  <button className={`btn btn-bet${enrage?" enrage":""}`} onClick={requestBet} disabled={betAmount<effMin||betAmount>gs.money}>PLACE BET ▶</button>
+                  <div style={{fontSize:11,color:"#565668",letterSpacing:2,textAlign:"center"}}>min ¢{effMin} · max ¢{gs.money} · [↑↓] adjust · [ENTER] place</div>
+                </div>
+              )}
+
+              {/* CONFIRM */}
+              {gs.phase==="BETTING"&&betConfirming&&(
+                <div className="conf-panel">
+                  <div className="conf-ttl">CONFIRM YOUR BET</div>
+                  <div className="conf-amt">¢{betAmount}</div>
+                  <div className="conf-warn">
+                    {isLow?`⚠ Only ¢${gs.money} remaining.`
+                      :betAmount===gs.money?"⚠ ALL IN — no safety net."
+                      :enrage?"⚠ PHASE 2 — Judge is enraged."
+                      :`Committing ¢${betAmount} this round.`}
+                  </div>
+                  <RiskMeter bet={betAmount} money={gs.money}/>
+                  <div className="conf-row">
+                    <button className="btn btn-cancel" onClick={cancelBet}>◀ BACK [ESC]</button>
+                    <button className="btn btn-confirm" onClick={confirmBet}>CONFIRM [ENTER] ▶▶</button>
+                  </div>
+                </div>
+              )}
+
+              {/* PLAYER TURN */}
+              {gs.phase==="PLAYER_TURN"&&(
+                <>
+                  <div className="act-row">
+                    <button className="btn btn-hit" onClick={playerHit}>HIT [H]</button>
+                    <button className="btn btn-stand" onClick={playerStand}>STAND [S]</button>
+                  </div>
+                  {gs.shieldActive&&<div className="shield-bar">⛉ OVERRIDE SHIELD ACTIVE</div>}
+                  {gs.skills.length>0&&<div style={{fontSize:9,color:C.grey,letterSpacing:2,textAlign:"center"}}>← click skill in left panel to activate</div>}
+                </>
+              )}
+              {(gs.phase==="JUDGE_REVEAL"||gs.phase==="JUDGE_TURN")&&<div style={{height:40}}/>}
+            </div>
+
+            {/* PLAYER HAND */}
+            {gs.phase!=="BETTING"&&(
+              <div className={`pzone${gs.shieldActive?" shield":""} ${pZoneCls}`}>
+                <div className="zone-lbl" style={{color:C.gold}}>
+                  ▼ YOU
+                  <span className={`zone-score${pScore>21&&!gs.shieldActive?" sdanger":""}`} style={{color:pScore>21&&!gs.shieldActive?C.redB:C.white}}>
+                    {gs.playerHand.length?pScore:"--"}{pScore>21&&!gs.shieldActive&&" BUST"}
+                  </span>
+                </div>
+                <div className="hand-row">
+                  {gs.playerHand.map((c,i)=><CardView key={`p-${i}-${c.rank}${c.suit}`} card={c} animCls={anims[`p-${i}`]||""} shield={gs.shieldActive} slowReveal={i===slowIdx} crit={i===critIdx}/>)}
+                  {gs.playerHand.length===0&&<span style={{color:C.greyD,fontSize:11,letterSpacing:2}}>AWAITING DEAL</span>}
+                </div>
+              </div>
+            )}
+          </div>
+          <div className="info-bar">
+            FRA143 SOFTWARE DEVELOPMENT FOR ROBOTICS AND AUTOMATION ENGINEERING — FIBO KMUTT &nbsp;|&nbsp;
+            จิรายุ 68340500013 · ณฐกร 68340500062 · ภูริต 68340500086
+          </div>
+        </div>
+      </div>
+      </div>
+
+      {/* ROUND RESULT */}
+      {showResult&&gs.phase!=="GAME_OVER"&&gs.phase!=="VICTORY"&&(
+        <div className="result-ov" onClick={nextRound}>
+          <div className="res-txt" style={{color:RES[gs.result]?.c}}>
+            {gs.critHit&&gs.result==="PLAYER_WIN"?"⚡ CRITICAL STRIKE ⚡":gs.critHit&&gs.result==="JUDGE_WIN"?"⚡ COUNTER CRIT ⚡":RES[gs.result]?.t}
+          </div>
+          {gs.result!=="DRAW"&&(
+            <div className={`res-delta ${lastDelta>0?"pos":"neg"}`}>
+              {lastDelta>0?`+¢${lastDelta}`:`-¢${Math.abs(lastDelta)}`}{lastMult>1&&` ×${lastMult} STREAK`}{gs.critHit&&" ⚡ CRIT"}
+            </div>
+          )}
+          {gs.result==="DRAW"&&<div className="res-delta zero">No credits exchanged</div>}
+          {gs.result==="PLAYER_WIN"&&lastDelta!=null&&(
+            <div className={`res-jdmg${enrage?" enr":""}`}>⚖ JUDGE HP: ¢{gs.judgeHp} / ¢{JUDGE_MAX_HP} &nbsp;(−¢{lastDelta} dealt)</div>
+          )}
+          {gs.result==="JUDGE_WIN"&&gs.judgeHealAmount>0&&(
+            <div className="res-jheal">♥ JUDGE RECOVERED ¢{gs.judgeHealAmount} — LIFE STEAL<br/>⚖ JUDGE HP: ¢{gs.judgeHp} / ¢{JUDGE_MAX_HP}</div>
+          )}
+          <div className="res-sub">You: {pScore} &nbsp;·&nbsp; Judge: {jScore}</div>
+          {gs.result==="PLAYER_WIN"&&gs.consecutiveWins>0&&(
+            <div className="res-streak">WIN STREAK: {gs.consecutiveWins}{gs.consecutiveWins%3===0?" — MILESTONE!":""}</div>
+          )}
+          {newSkill&&<div className="sk-notice">✦ SKILL ACQUIRED: {newSkill} ✦</div>}
+          <div className="res-sub" style={{color:isLow?C.danger:C.grey}}>Balance: ¢{gs.money}{isLow?" ⚠ CRITICAL":""}</div>
+          {enrage&&<div style={{fontSize:11,color:C.enrage,letterSpacing:2,textAlign:"center"}}>⚠ PHASE 2 ACTIVE — MIN BET ¢{ENRAGE_MIN_BET}</div>}
+          <div className="res-cont">▼ click or [ENTER] to continue ▼</div>
+        </div>
+      )}
+
+      {/* GAME OVER */}
+      {gs.phase==="GAME_OVER"&&(
+        <div className="gameover-ov">
+          <div className="go-ttl">JUDGMENT HAS BEEN PASSED</div>
+          <div className="go-sub">You have been eliminated from the system.<br/>Your debt has been collected in full.</div>
+          <div className="go-stat">ROUNDS SURVIVED: {gs.round}</div>
+          <div className="go-stat" style={{color:C.redB}}>FINAL BALANCE: ¢{gs.money}</div>
+          <div className="go-stat" style={{color:C.grey}}>JUDGE REMAINING HP: ¢{gs.judgeHp}</div>
+          <button className="btn btn-restart" onClick={restart}>NEW SESSION [R]</button>
+        </div>
+      )}
+
+      {/* VICTORY */}
+      {gs.phase==="VICTORY"&&(
+        <div className="victory-ov">
+          <div className="v-ttl">THE JUDGE HAS FALLEN</div>
+          <div className="v-sub">You have shattered the system.<br/>Freedom has been reclaimed.</div>
+          <div className="v-stat">ROUNDS PLAYED: {gs.round}</div>
+          <div className="v-stat" style={{color:C.goldB}}>FINAL BALANCE: ¢{gs.money}</div>
+          <div className="v-stat" style={{color:C.green}}>JUDGE DEFEATED ✦</div>
+          <button className="btn btn-restart" style={{borderColor:C.goldB,color:C.goldB}} onClick={restart}>NEW SESSION [R]</button>
+        </div>
+      )}
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
