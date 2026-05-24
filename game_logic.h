@@ -318,6 +318,7 @@ private:
     float         lastMultiplier_;
     bool          critHit_;
     int           judgeHealAmount_;
+    bool          shieldAbsorbedBust_;   // true once the shield has saved a bust this round
     std::mt19937  rng_;
 
     EvaluationResult evaluate();

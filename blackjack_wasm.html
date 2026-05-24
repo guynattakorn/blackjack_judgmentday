@@ -694,7 +694,7 @@ function App() {
     await sleep(350); SFX.deal(1); setGs({...s,playerHand:s.playerHand.slice(0,2),judgeHand:[]}); addAnim("p-1","ar");
     await sleep(350); SFX.deal(2); setGs({...s,playerHand:s.playerHand.slice(0,2),judgeHand:[s.judgeHand[0]]}); addAnim("j-0","ar");
     await sleep(350); SFX.deal(3); setGs(s); addAnim("j-1","ar");
-    const ps = s.playerHand.reduce((t,c)=>{let v=c.value;if(t+v>21&&c.rank==="A")v=1;return t+v;},0);
+    const ps = calcScore(s.playerHand);
     setPlayerScore(ps);
     if(s.playerHand.length===2&&ps===21){ SFX.crit(); setCritIdx(1); setTimeout(()=>setCritIdx(-1),1000); }
     busy.current=false;
@@ -715,7 +715,7 @@ function App() {
     setGs({...s, playerHand: s.playerHand.slice(0, prevLen)});
     await sleep(80);
     setGs(s); addAnim(`p-${idx}`,"ar");
-    const sc = s.playerHand.reduce((t,c,i)=>{ if(c.faceDown) return t; let v=c.value; if(t+v>21&&c.rank==="A")v=1; return t+v; },0);
+    const sc = calcScore(s.playerHand);
     setPlayerScore(sc);
     if(s.phase==="JUDGE_REVEAL"){ // busted
       SFX.bust(); trigFlash("fb"); trigShake(enrNow);
@@ -821,7 +821,11 @@ function App() {
   // SKILL — calls C++ useSkill, pull result
   const useSkill = i => {
     if(!gs||gs.phase!=="PLAYER_TURN"||busy.current) return;
-    SFX.card(); GE.useSkill(i); pull(); setGs({...GE.getState()});
+    busy.current = true;
+    SFX.card();
+    GE.useSkill(i);
+    pull();            // pull() already calls setGs internally
+    busy.current = false;
   };
 
   // NEXT ROUND
@@ -837,13 +841,16 @@ const nextRound = () => {
   setGs({...GE.getState()});  // pull state หลัง C++ reset แล้ว
 };
 
-  // RESTART
+  // RESTART — clears ALL state and routes back to the main menu (intro).
+  // The player must manually click through the intro and start a new session.
   const restart = () => {
     timers.current.forEach(clearTimeout); timers.current=[]; busy.current=false;
     setShowResult(false); setNewSkill(""); setTension(0); setJStatus(""); setFlash(""); setMoneyAnim("");
     setPlayerScore(0); setSlowIdx(-1); setShake(""); setCritIdx(-1); setShowCrit(false); setHealFlash(0);
     setLastDelta(null); setLastMult(1); setBetConfirming(false); setJudgeRevealScore(null);
     GE.newGame(); const s=pull(); setBetAmount(MIN_BET); setGs(s);
+    // Route back to intro / main menu — player starts fresh from page 0
+    setIntroPage(0); setShowIntro(true);
   };
 
 
@@ -907,10 +914,9 @@ const nextRound = () => {
   }
 
   // DERIVED
-  const pScore = gs.playerHand.filter(c=>!c.faceDown).reduce((t,c)=>t+c.value,0);
-  const _jScoreRaw = gs.judgeHand.filter(c=>!c.faceDown).reduce((t,c,_,arr)=>{
-    let v=c.value; return t+v;
-  },0);
+  const pScore = calcScore(gs.playerHand);
+  // Use calcScore() here too so Judge's final score folds Aces correctly in the result overlay
+  const _jScoreRaw = calcScore(gs.judgeHand);
   // ใช้ judgeRevealScore ระหว่าง animation เพื่อแสดง score ที่ค่อยๆ เพิ่มทีละใบ
   const jScore = judgeRevealScore !== null ? judgeRevealScore : _jScoreRaw;
   const showJScore = !["BETTING","PLAYER_TURN","DEALING"].includes(gs.phase);
@@ -1122,27 +1128,36 @@ const nextRound = () => {
         </div>
       )}
 
-      {/* GAME OVER */}
+      {/* GAME OVER — dramatic death screen, routes back to main menu */}
       {gs.phase==="GAME_OVER"&&(
         <div className="gameover-ov">
-          <div className="go-ttl">JUDGMENT HAS BEEN PASSED</div>
-          <div className="go-sub">You have been eliminated from the system.<br/>Your debt has been collected in full.</div>
-          <div className="go-stat">ROUNDS SURVIVED: {gs.round}</div>
-          <div className="go-stat" style={{color:C.redB}}>FINAL BALANCE: ¢{gs.money}</div>
-          <div className="go-stat" style={{color:C.grey}}>JUDGE REMAINING HP: ¢{gs.judgeHp}</div>
-          <button className="btn btn-restart" onClick={restart}>NEW SESSION [R]</button>
+          <div style={{fontSize:11,letterSpacing:4,color:"#5a0000",marginBottom:8}}>TRIBUNAL VERDICT — FINAL</div>
+          <div className="go-ttl">ELIMINATED</div>
+          <div style={{fontSize:12,color:C.redB,letterSpacing:3,textAlign:"center",animation:"blink .55s step-end infinite",marginTop:4}}>SUBJECT ERASED FROM SYSTEM</div>
+          <div className="go-sub" style={{marginTop:12}}>Your credits ran dry.<br/>The Judge has collected your debt in full.<br/>You no longer exist in the registry.</div>
+          <div style={{display:"flex",flexDirection:"column",gap:6,alignItems:"center",padding:"12px 24px",background:"rgba(120,15,15,.15)",border:"1px solid rgba(200,30,30,.25)",borderRadius:2}}>
+            <div className="go-stat">ROUNDS SURVIVED: {gs.round}</div>
+            <div className="go-stat" style={{color:C.redB}}>CREDITS AT DEATH: ¢{gs.money}</div>
+            <div className="go-stat" style={{color:C.grey}}>JUDGE REMAINING HP: ¢{gs.judgeHp} / ¢{JUDGE_MAX_HP}</div>
+          </div>
+          <button className="btn btn-restart" onClick={restart} style={{marginTop:8}}>◀ RETURN TO MENU [R]</button>
+          <div style={{fontSize:10,color:"#3a1515",letterSpacing:2,textAlign:"center",marginTop:4}}>A new session must be started from the beginning.</div>
         </div>
       )}
 
-      {/* VICTORY */}
+      {/* VICTORY — routes back to main menu for a full new run */}
       {gs.phase==="VICTORY"&&(
         <div className="victory-ov">
+          <div style={{fontSize:11,letterSpacing:4,color:C.goldD,marginBottom:8}}>TRIBUNAL VERDICT — FINAL</div>
           <div className="v-ttl">THE JUDGE HAS FALLEN</div>
-          <div className="v-sub">You have shattered the system.<br/>Freedom has been reclaimed.</div>
-          <div className="v-stat">ROUNDS PLAYED: {gs.round}</div>
-          <div className="v-stat" style={{color:C.goldB}}>FINAL BALANCE: ¢{gs.money}</div>
-          <div className="v-stat" style={{color:C.green}}>JUDGE DEFEATED ✦</div>
-          <button className="btn btn-restart" style={{borderColor:C.goldB,color:C.goldB}} onClick={restart}>NEW SESSION [R]</button>
+          <div className="v-sub">You have shattered the system.<br/>Freedom has been reclaimed from the ashes.</div>
+          <div style={{display:"flex",flexDirection:"column",gap:6,alignItems:"center",padding:"12px 24px",background:"rgba(212,175,55,.06)",border:`1px solid ${C.goldD}`,borderRadius:2}}>
+            <div className="v-stat">ROUNDS PLAYED: {gs.round}</div>
+            <div className="v-stat" style={{color:C.goldB}}>FINAL BALANCE: ¢{gs.money}</div>
+            <div className="v-stat" style={{color:C.green}}>JUDGE DEFEATED ✦</div>
+          </div>
+          <button className="btn btn-restart" style={{borderColor:C.goldB,color:C.goldB,marginTop:8}} onClick={restart}>◀ RETURN TO MENU [R]</button>
+          <div style={{fontSize:10,color:C.goldD,letterSpacing:2,textAlign:"center",marginTop:4}}>Glory fades. A new session awaits.</div>
         </div>
       )}
     </>

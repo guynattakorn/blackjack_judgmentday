@@ -279,6 +279,7 @@ void GameEngine::reset() {
     critHit_        = false;
     judgeHealAmount_= 0;
     lastResult_     = RoundResult::NONE;
+    shieldAbsorbedBust_ = false;
 }
 
 void GameEngine::startNextRound() {
@@ -286,10 +287,11 @@ void GameEngine::startNextRound() {
     judge_.clearHand();
     player_.resetBet();
     player_.deactivateShield();
-    lastResult_     = RoundResult::NONE;
-    critHit_        = false;
-    judgeHealAmount_= 0;
-    phase_          = Phase::BETTING;
+    lastResult_         = RoundResult::NONE;
+    critHit_            = false;
+    judgeHealAmount_    = 0;
+    shieldAbsorbedBust_ = false;
+    phase_              = Phase::BETTING;
 }
 
 std::string GameEngine::getPhaseString() const {
@@ -350,8 +352,21 @@ void GameEngine::deal() {
 bool GameEngine::playerHit() {
     if (phase_ != Phase::PLAYER_TURN) return false;
     player_.receiveCard(deck_.drawTop());
-    if (player_.isBust() && !player_.isShieldActive())
-        phase_ = Phase::JUDGE_REVEAL;
+    if (player_.isBust()) {
+        if (player_.isShieldActive() && !shieldAbsorbedBust_) {
+            // First bust while shield is active:
+            // Mark it as absorbed but KEEP the shield active so that evaluate()
+            // will see isShieldActive()==true and correctly skip the bust penalty.
+            // The player survives this bust and may continue to HIT or STAND.
+            shieldAbsorbedBust_ = true;
+        } else {
+            // Either no shield, or the shield already saved a bust this round.
+            // Deactivate shield (so evaluate() counts this as a real bust)
+            // and advance the phase to end the player's turn.
+            player_.deactivateShield();
+            phase_ = Phase::JUDGE_REVEAL;
+        }
+    }
     return true;
 }
 
@@ -362,13 +377,17 @@ void GameEngine::playerStand() {
 EvaluationResult GameEngine::evaluate() {
     EvaluationResult res;
 
+    // Shield stays active throughout the player's turn when it has absorbed a bust.
+    // So if the player busted but the shield is STILL active here, we treat it as
+    // NOT a bust (the shield protection holds for the rest of the round).
     const bool pBust  = player_.isBust() && !player_.isShieldActive();
     const bool jBust  = judge_.isBust();
     const int  pScore = player_.getScore();
     const int  jScore = judge_.getScore();
 
-    if      (pBust && !jBust) res.result = RoundResult::JUDGE_WIN;
-    else if (jBust && !pBust) res.result = RoundResult::PLAYER_WIN;
+    // Standard rule: player bust = judge wins regardless of judge bust status.
+    if      (pBust)           res.result = RoundResult::JUDGE_WIN;
+    else if (jBust)           res.result = RoundResult::PLAYER_WIN;
     else if (pScore > jScore) res.result = RoundResult::PLAYER_WIN;
     else if (jScore > pScore) res.result = RoundResult::JUDGE_WIN;
     else                      res.result = RoundResult::DRAW;
