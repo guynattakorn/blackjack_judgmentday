@@ -1,15 +1,13 @@
 # BLACKJACK: JUDGMENT DAY
 
 **FRA143 Software Development for Robotics and Automation Engineering — FIBO KMUTT**
-จิรายุ 68340500013 · ณฐกร 68340500062 · ภูริต 68340500086
+ก้องภพ 68340500003 · จิรายุ 68340500013 · ณฐกร 68340500062 · ภูริต 68340500086 
 
 
 ---
 
-## Demo Video
-
-มอบครับตัดไม่ทัน
-https://drive.google.com/drive/folders/1CNeb3qh8LXULDr9uoVMKYXIUEhQAHjmI?usp=sharing
+## Demo Video อัพเดตครับ
+https://youtu.be/o4GBMYtoOW8
 
 ---
 
